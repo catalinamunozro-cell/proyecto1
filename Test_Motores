@@ -1,0 +1,84 @@
+/*
+  Test de motores – TB6612FNG + N20 (Arduino Nano)
+  Conexiones:
+    STBY D4
+    IZQ: AIN1 D7, AIN2 D8, PWMA D5 (PWM)
+    DER: BIN1 D9, BIN2 D10, PWMB D6 (PWM)
+*/
+
+#include <Arduino.h>
+
+const uint8_t STBY = 4;
+const uint8_t AIN1 = 7, AIN2 = 8, PWMA = 5;    // Motor IZQ (canal A)
+const uint8_t BIN1 = 9, BIN2 = 10, PWMB = 6;   // Motor DER (canal B)
+
+// Cambia el signo si un motor gira al revés
+const int8_t LEFT_SIGN  = +1;
+const int8_t RIGHT_SIGN = +1;
+
+inline void driveTB6612(int16_t pwmL, int16_t pwmR) {
+  pwmL = constrain(pwmL, -255, 255);
+  pwmR = constrain(pwmR, -255, 255);
+
+  digitalWrite(STBY, HIGH); // habilita
+
+  // Izquierdo
+  int16_t vL = LEFT_SIGN * pwmL;
+  if (vL > 0) { digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);  analogWrite(PWMA, vL); }
+  else if (vL < 0) { digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH); analogWrite(PWMA, -vL); }
+  else { digitalWrite(AIN1, HIGH); digitalWrite(AIN2, HIGH); analogWrite(PWMA, 0); } // freno
+
+  // Derecho
+  int16_t vR = RIGHT_SIGN * pwmR;
+  if (vR > 0) { digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);  analogWrite(PWMB, vR); }
+  else if (vR < 0) { digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH); analogWrite(PWMB, -vR); }
+  else { digitalWrite(BIN1, HIGH); digitalWrite(BIN2, HIGH); analogWrite(PWMB, 0); } // freno
+}
+
+inline void stopTB6612() {
+  analogWrite(PWMA, 0); analogWrite(PWMB, 0);
+  digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW);
+  digitalWrite(STBY, LOW);
+}
+
+void setup() {
+  pinMode(STBY, OUTPUT);
+  pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT); pinMode(PWMA, OUTPUT);
+  pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT); pinMode(PWMB, OUTPUT);
+  Serial.begin(115200);
+  delay(200);
+  Serial.println(F("== Test Motores =="));
+}
+
+void loop() {
+  // Secuencia simple de verificación
+  const int V = 160;
+  const int T = 1200;
+
+  Serial.println(F("Adelante"));
+  driveTB6612(+V, +V); delay(T);
+
+  Serial.println(F("Freno"));
+  driveTB6612(0, 0); delay(500);
+
+  Serial.println(F("Atras"));
+  driveTB6612(-V, -V); delay(T);
+
+  Serial.println(F("Freno"));
+  driveTB6612(0, 0); delay(500);
+
+  Serial.println(F("Giro izquierda (on the spot)"));
+  driveTB6612(-V, +V); delay(T);
+
+  Serial.println(F("Giro derecha (on the spot)"));
+  driveTB6612(+V, -V); delay(T);
+
+  Serial.println(F("Barrido PWM izquierda"));
+  for (int p = 90; p <= 220; p += 10) { driveTB6612(p, 0); delay(250); }
+  driveTB6612(0,0); delay(400);
+
+  Serial.println(F("Barrido PWM derecha"));
+  for (int p = 90; p <= 220; p += 10) { driveTB6612(0, p); delay(250); }
+  driveTB6612(0,0); delay(800);
+}
