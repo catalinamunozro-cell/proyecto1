@@ -1,0 +1,99 @@
+/*
+  Test de sensores IR (6 analógicos) – imprime valores y posición relativa
+  Conexiones:
+    Emisores IR (opcional): D2
+    Sensores: A1..A6  (A1 = extremo IZQ, A6 = extremo DER)
+
+  Salida por Serial (115200):
+    RAW:    r1,r2,r3,r4,r5,r6
+    NORM:   n1..n6 (0..1000)
+    POS_Q:  posición QTR (0..5000, centro ~2500)
+    POS_R:  posición relativa aprox (-250..+250, centro ~0)
+    ONLINE: 0/1 (umbral por suma)
+*/
+
+#include <Arduino.h>
+
+#define PIN_IR 2
+const uint8_t SENS_PINS[6] = {A1, A2, A3, A4, A5, A6};
+
+int vmin_[6] = {1023,1023,1023,1023,1023,1023};
+int vmax_[6] = {0,0,0,0,0,0};
+
+const int ONLINE_SUM_TH = 1200;
+
+static inline int normalizeSample(int raw, int mn, int mx) {
+  if (mx <= mn) return 0;
+  long v = (long)(raw - mn) * 1000L / (long)(mx - mn);
+  if (v < 0) v = 0; if (v > 1000) v = 1000;
+  return (int)v;
+}
+
+void readRaw(uint16_t raw[6]) {
+  for (uint8_t i = 0; i < 6; ++i) raw[i] = (uint16_t)analogRead(SENS_PINS[i]);
+}
+
+uint16_t linePositionQTR(const uint16_t vals[6], uint32_t &sumOut) {
+  // vals deben venir normalizados 0..1000
+  uint32_t sum = 0, num = 0;
+  for (uint8_t i = 0; i < 6; ++i) { sum += vals[i]; num += (uint32_t)(i*1000) * vals[i]; }
+  sumOut = sum;
+  return (sum ? (uint16_t)(num / sum) : 2500);
+}
+
+void quickCalibrate(unsigned long ms = 2500) {
+  // Durante este tiempo, mueve manualmente el sensor por línea y fondo
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    for (uint8_t i = 0; i < 6; ++i) {
+      int r = analogRead(SENS_PINS[i]);
+      if (r < vmin_[i]) vmin_[i] = r;
+      if (r > vmax_[i]) vmax_[i] = r;
+    }
+    delay(2);
+  }
+  // Ensancha rangos
+  for (uint8_t i = 0; i < 6; ++i) {
+    if (vmin_[i] > 20)   vmin_[i] -= 20;
+    if (vmax_[i] < 1003) vmax_[i] += 20;
+  }
+}
+
+void setup() {
+  pinMode(PIN_IR, OUTPUT); digitalWrite(PIN_IR, HIGH);
+  for (uint8_t i = 0; i < 6; ++i) pinMode(SENS_PINS[i], INPUT);
+  Serial.begin(115200);
+  delay(200);
+  Serial.println(F("== Test Sensores IR =="));
+  Serial.println(F("Calibrando (mueve el sensor por linea y fondo) ..."));
+  quickCalibrate(2500);
+  Serial.println(F("Listo. Imprimiendo lecturas."));
+}
+
+void loop() {
+  // RAW
+  uint16_t raw[6]; readRaw(raw);
+
+  // NORM 0..1000
+  uint16_t norm[6];
+  uint32_t sumN = 0;
+  for (uint8_t i = 0; i < 6; ++i) { norm[i] = (uint16_t)normalizeSample(raw[i], vmin_[i], vmax_[i]); sumN += norm[i]; }
+
+  // POSICIÓN: QTR (0..5000) y relativa ~(-250..+250)
+  uint32_t sumOut = 0;
+  uint16_t posQ = linePositionQTR(norm, sumOut);
+  int posRel = (int)(2500) - (int)posQ; // centro ~0 (izq +, der - aprox)
+
+  bool online = (sumN > (uint32_t)ONLINE_SUM_TH);
+
+  // Impresión compacta (CSV amigable)
+  Serial.print(F("RAW:"));
+  for (int i=0;i<6;i++){ Serial.print(i? ',':' '); Serial.print(raw[i]); }
+  Serial.print(F(" | NORM:"));
+  for (int i=0;i<6;i++){ Serial.print(i? ',':' '); Serial.print(norm[i]); }
+  Serial.print(F(" | POS_Q: ")); Serial.print(posQ);
+  Serial.print(F(" | POS_R: ")); Serial.print(posRel);
+  Serial.print(F(" | ONLINE: ")); Serial.println(online ? 1 : 0);
+
+  delay(60); // ~16 Hz de impresión
+}
