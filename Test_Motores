@@ -1,10 +1,4 @@
-/*
-  Test de motores – TB6612FNG + N20 (Arduino Nano)
-  Conexiones:
-    STBY D4
-    IZQ: AIN1 D7, AIN2 D8, PWMA D5 (PWM)
-    DER: BIN1 D9, BIN2 D10, PWMB D6 (PWM)
-*/
+
 
 #include <Arduino.h>
 
