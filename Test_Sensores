@@ -1,16 +1,4 @@
-/*
-  Test de sensores IR (6 analógicos) – imprime valores y posición relativa
-  Conexiones:
-    Emisores IR (opcional): D2
-    Sensores: A1..A6  (A1 = extremo IZQ, A6 = extremo DER)
 
-  Salida por Serial (115200):
-    RAW:    r1,r2,r3,r4,r5,r6
-    NORM:   n1..n6 (0..1000)
-    POS_Q:  posición QTR (0..5000, centro ~2500)
-    POS_R:  posición relativa aprox (-250..+250, centro ~0)
-    ONLINE: 0/1 (umbral por suma)
-*/
 
 #include <Arduino.h>
 
