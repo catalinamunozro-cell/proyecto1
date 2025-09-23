@@ -1,12 +1,11 @@
 
-
 #include <Arduino.h>
 
 const uint8_t STBY = 4;
 const uint8_t AIN1 = 7, AIN2 = 8, PWMA = 5;    // Motor IZQ (canal A)
 const uint8_t BIN1 = 9, BIN2 = 10, PWMB = 6;   // Motor DER (canal B)
 
-// Cambia el signo si un motor gira al revés
+
 const int8_t LEFT_SIGN  = +1;
 const int8_t RIGHT_SIGN = +1;
 
