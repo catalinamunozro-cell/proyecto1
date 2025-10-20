@@ -1,0 +1,371 @@
+/*
+  Robotracer Nano – Ruta económica (Arduino Nano + TB6612FNG + motores N20 + 6 IR analógicos)
+  Objetivo: máxima velocidad con robustez (PI-D + feedforward, rampa de velocidad, búsqueda de línea).
+  Copiar y pegar en el IDE de Arduino como un único sketch. Licencia: MIT.
+
+  CONEXIONES (ajusta si usas otros pines):
+  - TB6612FNG:
+      STBY -> D4
+      AIN1 -> D7
+      AIN2 -> D8
+      PWMA -> D5  (PWM)  -> Motor IZQ
+      BIN1 -> D9
+      BIN2 -> D10
+      PWMB -> D6  (PWM)  -> Motor DER
+  - Sensores IR (6 analógicos): A1..A6 (A1 = extremo IZQ, A6 = extremo DER)
+  - PIN_IR (opcional) para encender emisores IR -> D2 (si tu barra no lo usa, no pasa nada)
+  - Batería: LiPo 2S con regulador a 5 V; GND común para TODO.
+*/
+
+#include <Arduino.h>
+
+// ========================== Pines de hardware ==========================
+#define PIN_IR 2  // Pin para encender LEDs IR (si no aplica, se ignora)
+
+const uint8_t STBY = 4;
+const uint8_t AIN1 = 7, AIN2 = 8, PWMA = 5;    // Motor IZQ (canal A)
+const uint8_t BIN1 = 9, BIN2 = 10, PWMB = 6;   // Motor DER (canal B)
+
+// Sentido de mezcla (cambiar a -1 si tu motor gira al revés)
+const int8_t LEFT_SIGN  = +1;
+const int8_t RIGHT_SIGN = +1;
+
+// Sensores analógicos (6 unidades)
+const uint8_t SENS_PINS[6] = {A1, A2, A3, A4, A5, A6};
+
+// ========================== Lazo de control ============================
+const uint16_t LOOP_HZ = 400;               // Frecuencia del lazo (~400 Hz)
+const uint32_t DT_US   = 1000000UL / LOOP_HZ;
+const float    DT      = 1.0f / LOOP_HZ;
+
+// ========================== Calibración de sensores ====================
+int v_s_min[6] = {1023, 1023, 1023, 1023, 1023, 1023};
+int v_s_max[6] = {0, 0, 0, 0, 0, 0};
+volatile int s_p[6];                         // valores normalizados 0..1000
+boolean online = false;                      // si “ve” la línea
+const int ONLINE_SUM_TH = 1200;              // umbral de suma para considerar “en línea”
+
+// ========================== Control y planificación ====================
+struct PID {
+  float Kp, Ki, Kd;
+  float i;         // integrador
+  float d;         // derivada filtrada
+  float prevErr;
+};
+
+PID pid = {
+  .Kp = 0.24f,
+  .Ki = 0.00f,
+  .Kd = 0.16f,
+  .i = 0.0f,
+  .d = 0.0f,
+  .prevErr = 0.0f
+};
+
+const float D_ALPHA = 0.25f; // filtro derivativo (0..1, mayor = menos filtrado)
+const float I_MAX   = 80.0f; // límite integrador
+const float U_MAX   = 180.0f;// límite de giro (mezcla diferencial)
+
+// Feedforward de curvatura (proxy con segunda diferencia)
+const float K_FF = 0.20f;
+
+// Planificación de velocidad (PWM base y penalizaciones)
+uint8_t pwmCruise = 190;      // PWM base en recta (sube gradual si hay buen grip)
+const uint8_t PWM_MIN = 90;   // mínimo útil para no pararse
+const uint8_t PWM_MAX = 255;  // máximo absoluto
+
+// Penalizaciones (ajusta en pista según comportamiento)
+const float PENAL_ERR  = 0.0022f; // por |error|
+const float PENAL_EDOT = 0.0009f; // por |derivada de error|
+const float PENAL_CURV = 0.62f;   // por curvatura/“bordes” activos (0..1)
+
+// Limitadores de aceleración/jerk (suavizado de consigna de velocidad)
+const float DV_MAX = 120.0f * DT; // ΔPWM máx por ciclo
+const float DJ_MAX = 800.0f * DT; // Δ(ΔPWM) máx por ciclo
+float vPrev  = PWM_MIN;           // PWM previo
+float dvPrev = 0.0f;              // delta previo (para jerk)
+
+// Estados
+enum Mode { SEARCH, TRACE };
+Mode mode = SEARCH;
+
+// Variables auxiliares posición/curvatura
+int   pos  = 0, l_pos = 0;      // posición -255..+255 aprox
+float posPrev = 3500.0f, posPrev2 = 3500.0f;
+
+// Tiempo base para lazo fijo
+uint32_t t0;
+
+// ========================== Helpers de mapeo/normalización ====================
+static inline int normalizeSample(int raw, int mn, int mx) {
+  if (mx <= mn) return 0;
+  long v = (long)(raw - mn) * 1000L / (long)(mx - mn);
+  if (v < 0)   v = 0;
+  if (v > 1000) v = 1000;
+  return (int)v;
+}
+
+// ========================== Motores (TB6612) ===========================
+inline void tb6612_drive(int16_t pwmL, int16_t pwmR) {
+  // Saturación
+  if (pwmL >  PWM_MAX) pwmL = PWM_MAX;
+  if (pwmL < -PWM_MAX) pwmL = -PWM_MAX;
+  if (pwmR >  PWM_MAX) pwmR = PWM_MAX;
+  if (pwmR < -PWM_MAX) pwmR = -PWM_MAX;
+
+  digitalWrite(STBY, HIGH); // enable driver
+
+  // Izquierda
+  int16_t vL = LEFT_SIGN * pwmL;
+  if (vL > 0) { digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);  analogWrite(PWMA, vL);     }
+  else if (vL < 0) { digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH); analogWrite(PWMA, -vL); }
+  else { digitalWrite(AIN1, HIGH); digitalWrite(AIN2, HIGH); analogWrite(PWMA, 0); } // short brake
+
+  // Derecha
+  int16_t vR = RIGHT_SIGN * pwmR;
+  if (vR > 0) { digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);  analogWrite(PWMB, vR);     }
+  else if (vR < 0) { digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH); analogWrite(PWMB, -vR); }
+  else { digitalWrite(BIN1, HIGH); digitalWrite(BIN2, HIGH); analogWrite(PWMB, 0); } // short brake
+}
+
+inline void tb6612_stop() {
+  analogWrite(PWMA, 0);
+  analogWrite(PWMB, 0);
+  digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW);
+  digitalWrite(STBY, LOW);
+}
+
+// ========================== Sensores: lectura/calibración =====================
+void readRaw(uint16_t raw[6]) {
+  for (uint8_t i = 0; i < 6; ++i) raw[i] = (uint16_t)analogRead(SENS_PINS[i]); // 0..1023
+}
+
+void readCalibrated(uint16_t cal[6], uint32_t &sum) {
+  uint16_t raw[6]; readRaw(raw);
+  sum = 0;
+  for (uint8_t i = 0; i < 6; ++i) {
+    cal[i] = (uint16_t)normalizeSample((int)raw[i], v_s_min[i], v_s_max[i]); // 0..1000
+    sum += cal[i];
+  }
+}
+
+// Devuelve posición tipo QTR 0..5000 (6 sensores a 0..5 * 1000). Centro ~ 2500.
+// También entrega curveMetric ~ [0..1] (peso de bordes relativo al total)
+uint16_t readLinePosition(uint32_t &sumOut, float &curveMetric) {
+  uint16_t cal[6];
+  uint32_t sum; readCalibrated(cal, sum);
+  sumOut = sum;
+
+  uint32_t num = 0;
+  for (uint8_t i = 0; i < 6; ++i) {
+    uint16_t w = (uint16_t)(i * 1000); // 0, 1000, ..., 5000
+    num += (uint32_t)w * (uint32_t)cal[i];
+  }
+  uint16_t posQ = (sum > 0) ? (uint16_t)(num / sum) : 2500;
+
+  // Métrica de curvatura rápida: bordes (0 y 5) + vecinos (1 y 4)
+  uint32_t edges = (uint32_t)cal[0] + cal[1] + cal[4] + cal[5];
+  curveMetric = (sum > 0) ? (float)edges / (float)sum : 0.0f;
+
+  return posQ;
+}
+
+void calibrateSensors(unsigned long ms = 2500) {
+  // Inicializa rangos
+  for (uint8_t i = 0; i < 6; ++i) { v_s_min[i] = 1023; v_s_max[i] = 0; }
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    // Gira sobre sí mismo para exponer sensores a línea y fondo
+    tb6612_drive(+140, -140);
+    for (uint8_t i = 0; i < 6; ++i) {
+      int r = analogRead(SENS_PINS[i]);
+      if (r < v_s_min[i]) v_s_min[i] = r;
+      if (r > v_s_max[i]) v_s_max[i] = r;
+    }
+    delay(2);
+  }
+  tb6612_stop();
+
+  // Pequeño ensanche de rangos por seguridad
+  for (uint8_t i = 0; i < 6; ++i) {
+    if (v_s_min[i] > 20)   v_s_min[i] -= 20;
+    if (v_s_max[i] < 1003) v_s_max[i] += 20;
+  }
+}
+
+// ========================== Posición tipo “GetPos()” ==========================
+int GetPos() {
+  // Llena s_p[] y estatus online
+  long sum = 0;
+  for (uint8_t i = 0; i < 6; ++i) {
+    int raw = analogRead(SENS_PINS[i]); // crudo
+    s_p[i] = normalizeSample(raw, v_s_min[i], v_s_max[i]); // 0..1000
+    sum += s_p[i];
+  }
+  online = (sum > ONLINE_SUM_TH);
+
+  // Ponderación simétrica (-2.5 .. +2.5)
+  float prom = -2.5f * s_p[0] - 1.5f * s_p[1] - 0.5f * s_p[2]
+               + 0.5f  * s_p[3] + 1.5f  * s_p[4] + 2.5f  * s_p[5];
+  float denom = (float)sum;
+
+  if (online && denom > 1.0f) {
+    pos = int(100.0f * prom / denom); // típico -250..+250
+  } else {
+    // Si se perdió la línea, conserva sentido previo
+    pos = (l_pos < 0) ? -255 : 255;
+  }
+  l_pos = pos;
+  return pos;
+}
+
+// ========================== Planificador de velocidad ==========================
+float planSpeedPWM(float basePWM, float absErr, float absEdot, float curveM) {
+  float penalty = 1.0f
+                - PENAL_ERR  * absErr
+                - PENAL_EDOT * absEdot
+                - PENAL_CURV * curveM;
+
+  if (penalty < 0.35f) penalty = 0.35f;      // evita caer demasiado
+  float target = basePWM * penalty;
+
+  // Limitadores: jerk y aceleración (sobre PWM)
+  float dv  = target - vPrev;                 // ΔPWM actual
+  float ddv = dv - dvPrev;                    // jerk discreto
+
+  // Limitar jerk
+  if (ddv >  DJ_MAX) ddv = DJ_MAX;
+  if (ddv < -DJ_MAX) ddv = -DJ_MAX;
+  dv = dvPrev + ddv;
+
+  // Limitar aceleración
+  if (dv >  DV_MAX) dv = DV_MAX;
+  if (dv < -DV_MAX) dv = -DV_MAX;
+
+  float v = vPrev + dv;
+
+  // Guardar
+  dvPrev = dv;
+  vPrev  = v;
+
+  // Límites y suelo
+  if (v < PWM_MIN) v = PWM_MIN;
+  if (v > PWM_MAX) v = PWM_MAX;
+  return v;
+}
+
+// ========================== Control PI-D + Feedforward ========================
+float controller(float error, float dHeadingProxy, float ffTerm) {
+  // Derivada filtrada
+  float dRaw = dHeadingProxy;                  // proxy ya derivado
+  pid.d = (1.0f - D_ALPHA) * pid.d + D_ALPHA * dRaw;
+
+  // Integrador con anti-windup (clamping)
+  pid.i += pid.Ki * error * DT;
+  if (pid.i >  I_MAX) pid.i =  I_MAX;
+  if (pid.i < -I_MAX) pid.i = -I_MAX;
+
+  float u = pid.Kp * error + pid.i - pid.Kd * pid.d + ffTerm;
+
+  // Limitar mando de giro
+  if (u >  U_MAX) u =  U_MAX;
+  if (u < -U_MAX) u = -U_MAX;
+
+  pid.prevErr = error;
+  return u;
+}
+
+// ========================== SETUP / LOOP ======================================
+void setup() {
+  pinMode(PIN_IR, OUTPUT); digitalWrite(PIN_IR, HIGH); // enciende emisores IR
+
+  pinMode(STBY, OUTPUT);
+  pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT); pinMode(PWMA, OUTPUT);
+  pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT); pinMode(PWMB, OUTPUT);
+
+  // Entradas analógicas (sensores)
+  for (uint8_t i = 0; i < 6; ++i) pinMode(SENS_PINS[i], INPUT);
+
+  // (Opcional) Serial para debug
+  // Serial.begin(115200); delay(100);
+
+  // Calibración inicial (mueve el robot sobre línea/fondo durante ~2.5 s)
+  calibrateSensors(2500);
+
+  // Arranque
+  mode = TRACE;
+  vPrev = PWM_MIN; dvPrev = 0.0f;
+  posPrev = posPrev2 = 3500.0f;
+
+  t0 = micros();
+}
+
+void loop() {
+  // Lazo determinista
+  while ((micros() - t0) < DT_US) { /* espera muy breve */ }
+  t0 += DT_US;
+
+  // === Sense / Estimate ===
+  uint32_t sum = 0;
+  float curveM = 0.0f;
+  uint16_t posQ = readLinePosition(sum, curveM); // 0..5000, centro ~2500
+
+  // Mapeo a error (similar a GetPos pero con 6 bins 0..5 centrado en 2.5)
+  float error = 2500.0f - (float)posQ;          // mm “virtuales”
+  // Derivada de heading (proxy por diferencia de posición)
+  float dHeading = ((float)posQ - posPrev) / DT;
+  // Segunda diferencia (curvatura proxy con escala temporal)
+  float ddPos = ((float)posQ - 2.0f*posPrev + posPrev2) / (DT*DT);
+  posPrev2 = posPrev;
+  posPrev  = (float)posQ;
+
+  // Verifica línea
+  if (sum < (uint32_t)ONLINE_SUM_TH) {
+    mode = SEARCH;
+  } else if (mode == SEARCH) {
+    // reenganche
+    mode = TRACE;
+    vPrev = PWM_MIN;
+    pid.i = 0.0f; pid.d = 0.0f;
+  }
+
+  if (mode == SEARCH) {
+    // Gira hacia el último lado conocido para reencontrar la línea
+    int dir = (error >= 0.0f) ? +1 : -1; // si no hay info, usa signo de error actual
+    tb6612_drive(120 * dir, -120 * dir);
+    return;
+  }
+
+  // === Speed planning ===
+  float vTarget = planSpeedPWM((float)pwmCruise, fabs(error), fabs(dHeading), constrain(curveM, 0.0f, 1.0f));
+
+  // === Feedforward de curvatura ===
+  float ff = K_FF * (ddPos * DT); // discreto y pequeño para no dominar
+
+  // === Control (PI-D) ===
+  float u = controller(error, dHeading, ff);
+
+  // Mezcla diferencial
+  int16_t pwmL = (int16_t)roundf(vTarget + u);
+  int16_t pwmR = (int16_t)roundf(vTarget - u);
+
+  // Anti-windup adicional si satura “contra” el error
+  if ((pwmL >= PWM_MAX && error > 0) || (pwmR >= PWM_MAX && error < 0) ||
+      (pwmL <= -PWM_MAX && error < 0) || (pwmR <= -PWM_MAX && error > 0)) {
+    pid.i *= 0.98f;
+  }
+
+  // === Actuate ===
+  tb6612_drive(pwmL, pwmR);
+
+  // (Opcional) Telemetría:
+  // Serial.print((int)error); Serial.print(',');
+  // Serial.print((int)dHeading); Serial.print(',');
+  // Serial.print((int)(curveM*1000)); Serial.print(',');
+  // Serial.print((int)vTarget); Serial.print(',');
+  // Serial.print((int)u); Serial.print(',');
+  // Serial.print((int)pwmL); Serial.print(',');
+  // Serial.println((int)pwmR);
+}
